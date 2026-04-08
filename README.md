@@ -8,7 +8,7 @@ This custom node converts a single 360° equirectangular panorama into a fully e
 ---
 
 ## The Dependency Hell (Read Before Installing)
-The original Pano2Room research repository is incredible, but it relies on a highly fragile, outdated web of Python dependencies. If you attempt a standard `pip install -r requirements.txt` on a modern cloud GPU (like RunPod with PyTorch 2.4+ and CUDA 12+), **the 3D engine will instantly crash.** To make this usable for VFX artists, we engineered a custom installer script that automatically applies the following critical patches:
+The original Pano2Room research repository is incredible, but it relies on a highly fragile, outdated web of Python dependencies. If you attempt a standard `pip install -r requirements.txt` on a modern cloud GPU (like RunPod with PyTorch 2.4+ and CUDA 12+), **the 3D engine will instantly crash.** To make this usable for VFX artists, there is a custom installer script that automatically applies the following critical patches:
 
 1. **The `xformers` Bypass:** The original code hard-requires legacy `xformers` for memory efficiency, which fails to compile on modern PyTorch versions. Our script patches the source code to natively use PyTorch 2.0+ Scaled Dot Product Attention (SDPA) instead.
 2. **The Hugging Face API Fix:** The original code tries to download `stable-diffusion-2-inpainting` from a gated StabilityAI repository, which throws a `401 Unauthorized` error. This script repoints the codebase to the ungated community mirror.
