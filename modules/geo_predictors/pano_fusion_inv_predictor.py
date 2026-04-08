@@ -15,6 +15,7 @@ from utils.geo_utils import panorama_to_pers_directions
 from utils.camera_utils import img_coord_to_sample_coord, img_to_pano_coord,\
     direction_to_img_coord, img_coord_to_pano_direction, direction_to_pers_img_coord, pers_depth_to_normal
 from utils.common_utils import write_image
+from utils.plane_utils import fit_dominant_planes
 
 
 def scale_unit(x):
@@ -22,11 +23,12 @@ def scale_unit(x):
 
 
 class PanoFusionInvPredictor(GeoPredictor):
-    def __init__(self):
+    def __init__(self, planar_loss_weight=0.1):
         super().__init__()
         # self.depth_predictor = BiNormalPredictor()
         self.depth_predictor = OmnidataPredictor()
         # self.depth_predictor = IronPredictor()
+        self.planar_loss_weight = planar_loss_weight
 
     def inpaint_distance(self, img, ref_distance, mask, gen_res=384):
         '''
@@ -66,6 +68,23 @@ class PanoFusionInvPredictor(GeoPredictor):
         pano_coord = img_to_pano_coord(pano_img_coords)
         distortion_weights = torch.cos(pano_coord[:, :, 0])
         pano_dirs = img_coord_to_pano_direction(pano_img_coords)
+        pano_dirs_flat = pano_dirs.reshape(-1, 3).to(device)  # [H*W, 3], reused in planar loss
+
+        # --- One-time RANSAC plane fitting (before optimization loop) ---
+        dominant_planes = []
+        if self.planar_loss_weight > 0:
+            dist_flat_ref = ref_distance.squeeze().reshape(-1)   # [H*W]
+            mask_flat_ref = mask.squeeze().reshape(-1)           # [H*W]
+            valid_for_fit = (mask_flat_ref < 0.5) & (dist_flat_ref > 1e-2)
+            if int(valid_for_fit.sum()) >= 100:
+                valid_pts = (pano_dirs_flat * dist_flat_ref[:, None])[valid_for_fit]
+                valid_idx = valid_for_fit.nonzero(as_tuple=True)[0]
+                N_full = pano_height * pano_width
+                for normal, d, local_mask in fit_dominant_planes(valid_pts.cpu(), n_planes=3):
+                    full_mask = torch.zeros(N_full, dtype=torch.bool)
+                    full_mask[valid_idx.cpu()[local_mask]] = True
+                    dominant_planes.append((normal, d, full_mask))
+
         pers_imgs = F.grid_sample(img[None].expand(n_pers, -1, -1, -1), sample_coords, padding_mode='border') # [n_pers, 3, gen_res, gen_res]
         pred_depths_raw = []
 
@@ -149,7 +168,20 @@ class PanoFusionInvPredictor(GeoPredictor):
 
 
             reg_loss = (scales.mean() - 1.)**2
-            loss = align_loss + bias_tv_loss * 5 + reg_loss * 1e-2
+
+            planar_loss = torch.tensor(0., device=device)
+            if dominant_planes:
+                dist_flat_pred = pano_distance.reshape(-1)   # [H*W]
+                for plane_normal, plane_d, inlier_mask in dominant_planes:
+                    im  = inlier_mask.to(device)
+                    pn  = plane_normal.to(device)
+                    pd  = plane_d.to(device)
+                    inlier_dists = dist_flat_pred[im]                        # [M]
+                    inlier_pts   = pano_dirs_flat[im] * inlier_dists[:, None]  # [M, 3]
+                    deviation    = (inlier_pts @ pn - pd).abs()
+                    planar_loss  = planar_loss + deviation.mean()
+
+            loss = align_loss + bias_tv_loss * 5 + reg_loss * 1e-2 + planar_loss * self.planar_loss_weight
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()

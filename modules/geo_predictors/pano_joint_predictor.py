@@ -14,6 +14,7 @@ import tinycudann as tcnn
 
 from utils.geo_utils import panorama_to_pers_directions
 from utils.camera_utils import *
+from utils.plane_utils import fit_dominant_planes
 
 from PIL import Image, ImageDraw
 
@@ -99,8 +100,9 @@ class PanoJointPredictor(GeoPredictor):
         normals = normals * is_inside + -normals * (1. - is_inside)
         return normals
 
-    def __call__(self, key, img, ref_distance, mask, gen_res=512, 
-                 reg_loss_weight=1e-1, normal_loss_weight=1e-2, normal_tv_loss_weight=1e-2): 
+    def __call__(self, key, img, ref_distance, mask, gen_res=512,
+                 reg_loss_weight=1e-1, normal_loss_weight=1e-2, normal_tv_loss_weight=1e-2,
+                 dominant_planes=None, planar_loss_weight=0.1):
         
         height, width, _ = img.shape
         device = img.device
@@ -174,11 +176,51 @@ class PanoJointPredictor(GeoPredictor):
                 pred_normals = pred_normals.permute(0, 3, 1, 2)  
                 pred_normals_raw.append(pred_normals)
 
-        pred_distances_raw = torch.cat(pred_distances_raw, dim=0)  
-        pred_normals_raw = torch.cat(pred_normals_raw, dim=0)     
+        pred_distances_raw = torch.cat(pred_distances_raw, dim=0)
+        pred_normals_raw = torch.cat(pred_normals_raw, dim=0)
         pers_dirs = pers_dirs.permute(0, 3, 1, 2)
 
         sup_infos = torch.cat([pers_dirs, pred_distances_raw, pred_normals_raw], dim=1)
+
+        # --- One-time RANSAC plane fitting before the optimization loop ---
+        # _planes stores (plane_normal, plane_d, inlier_img [1,1,H,W] float)
+        # inlier_img is used with F.grid_sample inside the loop.
+        _planes = []
+        if planar_loss_weight > 0:
+            if dominant_planes is not None:
+                # Caller pre-computed planes (e.g. from init_distance in PanoFusionDistancePredictor).
+                _planes = dominant_planes
+            else:
+                # Back-project perspective depth predictions to panoramic space
+                # to build an initial distance map suitable for RANSAC.
+                pano_dirs_fit = img_coord_to_pano_direction(
+                    img_coord_from_hw(height, width)).to(device)             # [H, W, 3]
+                dist_accum = torch.zeros(height, width, device=device)
+                wt_accum   = torch.zeros(height, width, device=device)
+                for i in range(n_pers):
+                    proj_c, proj_m = direction_to_pers_img_coord(
+                        pano_dirs_fit, to_vecs[i], down_vecs[i], right_vecs[i])
+                    proj_c_s = img_coord_to_sample_coord(proj_c)             # [H, W, 2]
+                    proj_d = F.grid_sample(
+                        pred_distances_raw[i:i+1], proj_c_s[None],
+                        padding_mode='border').squeeze()                      # [H, W]
+                    proj_m_f = proj_m.squeeze(-1).float()                    # [H, W]
+                    dist_accum += proj_d * proj_m_f
+                    wt_accum   += proj_m_f
+                init_dist = dist_accum / (wt_accum + 1e-8)                   # [H, W]
+
+                pano_dirs_flat_fit = pano_dirs_fit.reshape(-1, 3)            # [H*W, 3]
+                dist_flat_fit      = init_dist.reshape(-1)                   # [H*W]
+                valid_fit = dist_flat_fit > 1e-4
+                if int(valid_fit.sum()) >= 100:
+                    valid_pts_fit = (pano_dirs_flat_fit * dist_flat_fit[:, None])[valid_fit]
+                    valid_idx_fit = valid_fit.nonzero(as_tuple=True)[0]
+                    N_full = height * width
+                    for normal, d, local_mask in fit_dominant_planes(valid_pts_fit.cpu(), n_planes=3):
+                        full_mask = torch.zeros(N_full, dtype=torch.float32)
+                        full_mask[valid_idx_fit.cpu()[local_mask]] = 1.0
+                        inlier_img = full_mask.reshape(1, 1, height, width)  # [1, 1, H, W]
+                        _planes.append((normal, d, inlier_img))
 
         scale_params = torch.zeros([n_pers], requires_grad=True)
         bias_params_global = torch.zeros([n_pers], requires_grad=True)
@@ -269,18 +311,33 @@ class PanoJointPredictor(GeoPredictor):
                     normal_bias_tv_loss = 0.
 
                 pano_image_coords = direction_to_img_coord(dirs.reshape(-1, 3))
-                pano_sample_coords = img_coord_to_sample_coord(pano_image_coords) 
-                sampled_ref_distance_mask = F.grid_sample(ref_distance_mask[None], pano_sample_coords[None, :, None, :], padding_mode='border')  
+                pano_sample_coords = img_coord_to_sample_coord(pano_image_coords)
+                sampled_ref_distance_mask = F.grid_sample(ref_distance_mask[None], pano_sample_coords[None, :, None, :], padding_mode='border')
                 sampled_ref_distance = sampled_ref_distance_mask[0, 0]
                 sampled_ref_mask =     sampled_ref_distance_mask[0, 1]
                 ref_distance_loss = F.smooth_l1_loss(sampled_ref_distance.reshape(-1), pred_distances.reshape(-1), beta=1e-2, reduction='none')
                 ref_distance_loss = (ref_distance_loss * (sampled_ref_mask < .5).reshape(-1)).mean()
 
+                planar_loss = torch.tensor(0., device=device)
+                if _planes:
+                    flat_dirs  = dirs.reshape(-1, 3).detach()       # [N, 3], no grad through dirs
+                    flat_dists = pred_distances.reshape(-1)          # [N],    grad through sp_dis_field
+                    flat_pts   = flat_dirs * flat_dists[:, None]     # [N, 3]
+                    for plane_normal, plane_d, inlier_img in _planes:
+                        w = F.grid_sample(
+                            inlier_img.to(device),
+                            pano_sample_coords[None, :, None, :],
+                            padding_mode='border')
+                        w = w[0, 0, :, 0]                           # [N]
+                        dev = (flat_pts @ plane_normal.to(device) - plane_d.to(device)).abs()
+                        planar_loss = planar_loss + (dev * w).sum() / (w.sum() + 1e-8)
+
                 loss = ref_distance_loss * 20. * progress + \
-                       distance_loss + reg_loss * reg_loss_weight +\
-                       normal_loss * normal_loss_weight +\
-                       distance_bias_tv_loss * 1. +\
-                       normal_bias_tv_loss * normal_tv_loss_weight
+                       distance_loss + reg_loss * reg_loss_weight + \
+                       normal_loss * normal_loss_weight + \
+                       distance_bias_tv_loss * 1. + \
+                       normal_bias_tv_loss * normal_tv_loss_weight + \
+                       planar_loss * planar_loss_weight
             
                 optimizer_global.zero_grad()
                 optimizer_sp.zero_grad()
