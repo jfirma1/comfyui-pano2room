@@ -4,6 +4,7 @@ import torch
 import trimesh
 
 from utils.camera_utils import *
+from utils.plane_utils import fit_dominant_planes
 from modules.geo_predictors import PanoFusionInvPredictor, PanoFusionNormalPredictor, PanoGeoRefiner, PanoJointPredictor
 
 import torchvision
@@ -52,13 +53,14 @@ class PanoFusionDistance:
         refiner = PanoGeoRefiner()
         return refiner.refine(distance_map, normal_map)
 
-    def get_joint_distance_normal(self, init_distance=None, init_mask=None):
+    def get_joint_distance_normal(self, init_distance=None, init_mask=None, dominant_planes=None):
 
         joint_predictor = PanoJointPredictor()
         idx = 0
         ref_distance, ref_normal = joint_predictor(idx, self.image,
                                                     torch.ones([self.pano_height, self.pano_width, 1]),
-                                                    torch.ones([self.pano_height, self.pano_width]))
+                                                    torch.ones([self.pano_height, self.pano_width]),
+                                                    dominant_planes=dominant_planes)
 
         return ref_distance, ref_normal
 
@@ -100,6 +102,28 @@ class PanoFusionDistancePredictor(PanoFusionDistance):
         self.pano_width, self.pano_height = pano_width, pano_height
         self.image = pano_tensor.cuda()
 
-        self.ref_distance, self.ref_normal = self.get_joint_distance_normal(init_distance, init_mask)
-        
+        # If a prior depth estimate is available, fit planes once here and
+        # thread them into the joint predictor to avoid redundant computation.
+        dominant_planes = None
+        if init_distance is not None:
+            pano_dirs_pp   = img_coord_to_pano_direction(img_coord_from_hw(pano_height, pano_width))
+            dist_flat_pp   = init_distance.reshape(-1).float().cpu()
+            dirs_flat_pp   = pano_dirs_pp.reshape(-1, 3)
+            valid_pp       = dist_flat_pp > 1e-2
+            if int(valid_pp.sum()) >= 100:
+                valid_pts_pp  = (dirs_flat_pp * dist_flat_pp[:, None])[valid_pp]
+                valid_idx_pp  = valid_pp.nonzero(as_tuple=True)[0]
+                N_full        = pano_height * pano_width
+                dominant_planes = []
+                for normal, d, local_mask in fit_dominant_planes(valid_pts_pp, n_planes=3):
+                    full_mask = torch.zeros(N_full, dtype=torch.float32)
+                    full_mask[valid_idx_pp[local_mask]] = 1.0
+                    inlier_img = full_mask.reshape(1, 1, pano_height, pano_width)
+                    dominant_planes.append((normal, d, inlier_img))
+                if not dominant_planes:
+                    dominant_planes = None
+
+        self.ref_distance, self.ref_normal = self.get_joint_distance_normal(
+            init_distance, init_mask, dominant_planes=dominant_planes)
+
         return self.ref_distance.squeeze(-1)
