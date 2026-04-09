@@ -1,6 +1,7 @@
 import torch
 import os
 import cv2
+import json
 from PIL import Image, ImageDraw
 import numpy as np
 from tqdm.auto import tqdm
@@ -28,6 +29,14 @@ from modules.geo_predictors.PanoFusionDistancePredictor import PanoFusionDistanc
 from modules.inpainters import PanoPersFusionInpainter
 from modules.geo_predictors import PanoJointPredictor
 from modules.mesh_fusion.sup_info import SupInfoPool
+from modules.ambiguity import (
+    AmbiguityManager,
+    apply_constraints,
+    dump_queries_json,
+    load_answer_payload,
+    parse_answers,
+    answers_to_constraints,
+)
 from kornia.morphology import erosion, dilation
 from scene.arguments import GSParams, CameraParams
 from scene import Scene, GaussianModel
@@ -489,19 +498,100 @@ class Pano2RoomPipeline(torch.nn.Module):
         write_video(f"{self.save_path}/GS_render_video.mp4", framelist[6:], fps=30)
         write_video(f"{self.save_path}/GS_depth_video.mp4", depthlist[6:], fps=30)
         print("Result saved at: ", self.save_path)
-            
-    def run(self):
+
+    def _runtime_settings(self):
+        return {
+            "resolution": int(self.H),
+            "fov": float(self.fov),
+            "inpaint_stride": int(self.inpaint_frame_stride),
+            "offset_x": float(self.pano_center_offset[0]),
+            "offset_z": float(self.pano_center_offset[1]),
+            "room_scale": float(self.pose_scale),
+            "save_details": bool(self.save_details),
+        }
+
+    def _apply_runtime_settings(self, runtime_settings):
+        self.H = int(runtime_settings.get("resolution", self.H))
+        self.W = int(runtime_settings.get("resolution", self.W))
+        self.fov = float(runtime_settings.get("fov", self.fov))
+        self.inpaint_frame_stride = int(runtime_settings.get("inpaint_stride", self.inpaint_frame_stride))
+        self.pano_center_offset = (
+            float(runtime_settings.get("offset_x", self.pano_center_offset[0])),
+            float(runtime_settings.get("offset_z", self.pano_center_offset[1])),
+        )
+        self.pose_scale = float(runtime_settings.get("room_scale", self.pose_scale))
+        self.save_details = bool(runtime_settings.get("save_details", self.save_details))
+        self.rendered_depth = torch.zeros((self.H, self.W), device=self.device)
+        self.inpaint_mask = torch.ones((self.H, self.W), device=self.device, dtype=torch.bool)
+
+    def _session_output_dir(self, stage_tag):
+        folder = os.path.join(self.save_path, f"clarification-{stage_tag}-{str(int(time.time()))[-8:]}")
+        os.makedirs(folder, exist_ok=True)
+        return folder
+
+    def prepare_ambiguity_probe(self, state_dir=None):
         torch.set_default_tensor_type('torch.cuda.FloatTensor')
         self.pano_pose, self.poses = self.load_camera_poses(self.pano_center_offset)
         pano_rgb, pano_depth = self.load_pano()
         panorama_tensor, init_depth = pano_rgb.squeeze(0).cuda(), pano_depth.cuda()
 
         depth_edge = self.find_depth_edge(init_depth.cpu().detach().numpy(), dilate_iter=1)
+        depth_edge_inpaint_mask = ~(torch.from_numpy(depth_edge).cuda().bool())
+
+        stage_dir = state_dir or self._session_output_dir("probe")
+        ambiguity_manager = AmbiguityManager(top_k=3)
+        ambiguity_info = ambiguity_manager.compute(
+            pano_rgb=panorama_tensor.permute(1, 2, 0).detach().cpu().numpy(),
+            init_depth=init_depth.detach().cpu().numpy(),
+            depth_edges=depth_edge.astype(np.uint8),
+        )
+
+        Image.fromarray(ambiguity_info["heatmap"]).save(os.path.join(stage_dir, "ambiguity_heatmap.png"))
+        Image.fromarray(ambiguity_info["overlay"]).save(os.path.join(stage_dir, "ambiguity_overlay.png"))
+        queries_path = os.path.join(stage_dir, "queries.json")
+        dump_queries_json(queries_path, ambiguity_info["queries"])
+
         depth_edge_pil = Image.fromarray(depth_edge)
         depth_pil = Image.fromarray(visualize_depth_numpy(init_depth.cpu().detach().numpy())[0].astype(np.uint8))
-        _, _ = save_rgbd(depth_pil, depth_edge_pil, f'depth_edge', 0, self.save_path)  
-        depth_edge_inpaint_mask = ~(torch.from_numpy(depth_edge).cuda().bool()) 
+        _, _ = save_rgbd(depth_pil, depth_edge_pil, f'depth_edge', 0, stage_dir)
 
+        state_payload = {
+            "pano_rgb": panorama_tensor.detach().cpu(),
+            "init_depth": init_depth.detach().cpu(),
+            "depth_edges": torch.from_numpy(depth_edge).cpu(),
+            "depth_edge_inpaint_mask": depth_edge_inpaint_mask.detach().cpu(),
+            "pano_pose": torch.from_numpy(self.pano_pose).float().cpu(),
+            "poses": torch.stack([p.cpu() for p in self.poses], dim=0),
+            "runtime_settings": self._runtime_settings(),
+            "scene_depth_max": float(self.scene_depth_max),
+        }
+        state_path = os.path.join(stage_dir, "intermediate_state.pt")
+        torch.save(state_payload, state_path)
+        metadata = {
+            "state_path": state_path,
+            "queries_path": queries_path,
+            "runtime_settings": self._runtime_settings(),
+            "saved_tensors": [
+                "pano_rgb",
+                "init_depth",
+                "depth_edges",
+                "depth_edge_inpaint_mask",
+                "pano_pose",
+                "poses",
+            ],
+        }
+        with open(os.path.join(stage_dir, "state_metadata.json"), "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+        return {
+            "state_path": state_path,
+            "state_dir": stage_dir,
+            "queries": ambiguity_info["queries"],
+            "queries_path": queries_path,
+            "ambiguity_heatmap_path": os.path.join(stage_dir, "ambiguity_heatmap.png"),
+            "ambiguity_overlay_path": os.path.join(stage_dir, "ambiguity_overlay.png"),
+        }
+
+    def _continue_from_initial_mesh(self, panorama_tensor, init_depth, depth_edge_inpaint_mask):
         self.sup_pool = SupInfoPool()
         self.sup_pool.register_sup_info(pose=torch.eye(4).cuda(),
                                         mask=torch.ones([self.pano_height, self.pano_width]),
@@ -601,11 +691,59 @@ class Pano2RoomPipeline(torch.nn.Module):
         eval_GS_cams = loadCamerasFromData(evaldata, self.opt.white_background)
         self.eval_GS(eval_GS_cams)
 
+    def resume_from_clarification(self, state_path, answer_json="", answer_json_path=""):
+        stage_dir = os.path.dirname(state_path)
+        state_payload = torch.load(state_path, map_location="cpu")
+        self._apply_runtime_settings(state_payload.get("runtime_settings", {}))
+        self.pano_pose = state_payload["pano_pose"].cpu().numpy()
+        self.poses = [p.cuda().float() for p in state_payload["poses"]]
+        self.scene_depth_max = float(state_payload.get("scene_depth_max", 4.0228885328450446))
+
+        panorama_tensor = state_payload["pano_rgb"].cuda()
+        init_depth = state_payload["init_depth"].cuda()
+        depth_edges = state_payload["depth_edges"].cuda()
+        depth_edge_inpaint_mask = state_payload["depth_edge_inpaint_mask"].cuda().bool()
+
+        queries_path = os.path.join(stage_dir, "queries.json")
+        queries_payload = {"queries": []}
+        if os.path.exists(queries_path):
+            with open(queries_path, "r", encoding="utf-8") as f:
+                queries_payload = json.load(f)
+
+        answers_payload = load_answer_payload(answer_json=answer_json, answer_json_path=answer_json_path)
+        answers = parse_answers(answers_payload)
+        constraints = answers_to_constraints(answers, queries_payload)
+
+        if answers:
+            with open(os.path.join(stage_dir, "clarification_answers.json"), "w", encoding="utf-8") as f:
+                json.dump(answers_payload, f, indent=2)
+
+        if constraints:
+            init_depth, depth_edges, depth_edge_inpaint_mask, debug_img = apply_constraints(
+                init_depth=init_depth,
+                depth_edges=depth_edges,
+                depth_edge_inpaint_mask=depth_edge_inpaint_mask,
+                constraints=constraints,
+            )
+            Image.fromarray(debug_img).save(os.path.join(stage_dir, "applied_constraints_debug.png"))
+        # TODO: add optional update-stage escalation during greedy inpainting with iterative human feedback.
+
+        self._continue_from_initial_mesh(panorama_tensor, init_depth, depth_edge_inpaint_mask)
+        return {"state_dir": stage_dir, "status": "resume_complete"}
+
+    def run(self):
+        probe = self.prepare_ambiguity_probe()
+        return self.resume_from_clarification(probe["state_path"])
+
 import argparse
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--attempt_idx", type=str, default="")
+    parser.add_argument("--mode", type=str, default="full", choices=["full", "probe", "resume"])
+    parser.add_argument("--state_path", type=str, default="")
+    parser.add_argument("--answer_json", type=str, default="")
+    parser.add_argument("--answer_json_path", type=str, default="")
     parser.add_argument("--inpaint_stride", type=int, default=20, help="Lower number = more holes fixed, but slower.")
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--fov", type=float, default=90.0)
@@ -629,5 +767,18 @@ if __name__ == "__main__":
     pipeline.W = args.resolution
     pipeline.rendered_depth = torch.zeros((args.resolution, args.resolution), device=pipeline.device)
     pipeline.inpaint_mask = torch.ones((args.resolution, args.resolution), device=pipeline.device, dtype=torch.bool)
-        
-    pipeline.run()
+
+    if args.mode == "probe":
+        output = pipeline.prepare_ambiguity_probe(state_dir=args.state_path or None)
+        print(json.dumps(output))
+    elif args.mode == "resume":
+        if not args.state_path:
+            raise ValueError("--state_path is required in resume mode.")
+        output = pipeline.resume_from_clarification(
+            state_path=args.state_path,
+            answer_json=args.answer_json,
+            answer_json_path=args.answer_json_path,
+        )
+        print(json.dumps(output))
+    else:
+        pipeline.run()

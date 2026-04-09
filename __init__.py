@@ -31,6 +31,7 @@ import sys
 import shutil
 import glob
 import subprocess
+import json
 import numpy as np
 import torch
 from PIL import Image
@@ -276,6 +277,26 @@ class Pano2RoomNode:
             )
         
         print(f"[Pano2Room] {desc} completed successfully")
+        return result.stdout or ""
+
+
+def _parse_last_json_line(stdout_text):
+    for line in reversed((stdout_text or "").splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
+    return {}
+
+
+def _load_optional_image(path):
+    if path and os.path.exists(path):
+        return pil_to_tensor(Image.open(path).convert("RGB"))
+    blank = np.zeros((64, 64, 3), dtype=np.float32)
+    return torch.from_numpy(blank).unsqueeze(0)
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +328,92 @@ class Pano2RoomPLYLoader:
             size_mb = os.path.getsize(ply_path) / (1024 * 1024)
             print(f"[Pano2Room PLY Loader] Loaded: {ply_path} ({size_mb:.1f} MB)")
         return (ply_path,)
+
+
+class Pano2RoomAmbiguityProbe(Pano2RoomNode):
+    @classmethod
+    def INPUT_TYPES(cls):
+        base = Pano2RoomNode.INPUT_TYPES()
+        base["optional"]["state_dir"] = ("STRING", {"default": "", "multiline": False})
+        return base
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("ambiguity_heatmap", "ambiguity_overlay", "query_json", "state_path", "status")
+    FUNCTION = "run_probe"
+    CATEGORY = "3D/Pano2Room"
+
+    def run_probe(self, panorama, run_sdft=False, sdft_training_steps=500, inpaint_stride=20, render_resolution="512", camera_fov=90.0, room_scale=0.6, center_offset_x=-0.2, center_offset_forward=0.3, save_debug_passes=False, use_sky_mask=True, gpu_id=0, state_dir=""):
+        input_dir = os.path.join(PANO2ROOM_DIR, "input")
+        os.makedirs(input_dir, exist_ok=True)
+        tensor_to_pil(panorama).save(os.path.join(input_dir, "input_panorama.png"))
+
+        probe_args = [
+            "--mode", "probe",
+            "--inpaint_stride", str(inpaint_stride),
+            "--resolution", str(render_resolution),
+            "--fov", str(camera_fov),
+            "--room_scale", str(room_scale),
+            "--offset_x", str(center_offset_x),
+            "--offset_z", str(center_offset_forward),
+        ]
+        if save_debug_passes:
+            probe_args.append("--save_details")
+        if state_dir:
+            probe_args.extend(["--state_path", state_dir])
+
+        stdout = self._run_script("pano2room.py", gpu_id=gpu_id, desc="Pano2Room Ambiguity Probe", extra_args=probe_args)
+        payload = _parse_last_json_line(stdout)
+
+        heatmap = _load_optional_image(payload.get("ambiguity_heatmap_path"))
+        overlay = _load_optional_image(payload.get("ambiguity_overlay_path"))
+        query_json = json.dumps(payload.get("queries", {"queries": []}), indent=2)
+        state_path = payload.get("state_path", "")
+        status = "probe_complete" if state_path else "probe_failed"
+        return (heatmap, overlay, query_json, state_path, status)
+
+
+class Pano2RoomResumeFromClarification(Pano2RoomNode):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "state_path": ("STRING", {"default": "", "multiline": False}),
+            },
+            "optional": {
+                "answer_json": ("STRING", {"default": '{\"answers\": []}', "multiline": True}),
+                "answer_json_path": ("STRING", {"default": "", "multiline": False}),
+                "gpu_id": ("INT", {"default": 0, "min": 0, "max": 7}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("gs_ply_path", "applied_constraint_debug", "mesh_path", "status")
+    FUNCTION = "run_resume"
+    CATEGORY = "3D/Pano2Room"
+
+    def run_resume(self, state_path, answer_json='{"answers": []}', answer_json_path="", gpu_id=0):
+        if not state_path:
+            raise ValueError("state_path is required.")
+        args = ["--mode", "resume", "--state_path", state_path]
+        if answer_json_path:
+            args.extend(["--answer_json_path", answer_json_path])
+        elif answer_json:
+            args.extend(["--answer_json", answer_json])
+
+        self._run_script("pano2room.py", gpu_id=gpu_id, desc="Pano2Room Resume", extra_args=args)
+        result_dir = os.path.dirname(state_path)
+        debug_img = _load_optional_image(os.path.join(result_dir, "applied_constraints_debug.png"))
+
+        output_dir = os.path.join(PANO2ROOM_DIR, "output")
+        gs_ply_path = ""
+        ply_candidates = glob.glob(os.path.join(output_dir, "**", "*.ply"), recursive=True)
+        if ply_candidates:
+            gs_ply_path = max(ply_candidates, key=os.path.getsize)
+        mesh_path = ""
+        mesh_candidates = glob.glob(os.path.join(output_dir, "**", "*.obj"), recursive=True)
+        if mesh_candidates:
+            mesh_path = mesh_candidates[0]
+        return (gs_ply_path, debug_img, mesh_path, "resume_complete")
 
 
 # ---------------------------------------------------------------------------
@@ -417,12 +524,16 @@ class Pano2RoomCameraTrajectory:
 # ---------------------------------------------------------------------------
 NODE_CLASS_MAPPINGS = {
     "Pano2Room": Pano2RoomNode,
+    "Pano2RoomAmbiguityProbe": Pano2RoomAmbiguityProbe,
+    "Pano2RoomResumeFromClarification": Pano2RoomResumeFromClarification,
     "Pano2RoomPLYLoader": Pano2RoomPLYLoader,
     "Pano2RoomCameraTrajectory": Pano2RoomCameraTrajectory,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Pano2Room": "Pano2Room (Panorama → 3DGS)",
+    "Pano2RoomAmbiguityProbe": "Pano2Room Ambiguity Probe",
+    "Pano2RoomResumeFromClarification": "Pano2Room Resume From Clarification",
     "Pano2RoomPLYLoader": "Pano2Room PLY Loader",
     "Pano2RoomCameraTrajectory": "Pano2Room Camera Trajectory",
 }
