@@ -149,6 +149,7 @@ class SupInfoPool:
         self.all_sup_rays = None
         self.all_sup_distances = None
         self.all_sup_normals = None
+        self.last_geo_check_stats = dict()
 
     def register_sup_info(self, pose, mask, rgb, distance, normal=None):
         self.sup_infos.append(PanoSupInfo(pose=pose, mask=mask, color_map=rgb, distance_map=distance, normal_map=normal))
@@ -250,7 +251,7 @@ class SupInfoPool:
         '''
         pts = rays.o + rays.d * distances.squeeze()[..., None]
         height, width = pts.shape[:2]
-        mask = torch.ones([height, width, 1])
+        mask = torch.ones([height, width, 1], device=pts.device)
 
         for pano_idx in range(len(self.sup_infos)):
             sup_info = self.sup_infos[pano_idx]
@@ -280,7 +281,21 @@ class SupInfoPool:
         mask = (mask[None, :, :, :] > 0.5).float()
         mask = mask.permute(0, 3, 1, 2)
         mask = mask.permute(0, 2, 3, 1).contiguous().squeeze()
+        valid = float(mask.numel())
+        keep_ratio = float(mask.sum().item() / max(valid, 1.0))
+        self.last_geo_check_stats = {
+            "total_pixels": int(mask.numel()),
+            "keep_ratio": keep_ratio,
+            "conflict_density": float(1.0 - keep_ratio),
+        }
         return mask
+
+    def get_last_conflict_summary(self):
+        """
+        Lightweight stat plumbing for future escalation stage.
+        TODO: expose per-region conflict stats once update-stage ambiguity escalation is implemented.
+        """
+        return self.last_geo_check_stats.copy()
 
     
     def gen_occ_grid(self, res):
@@ -339,4 +354,3 @@ class SupInfoPool:
         self.all_sup_rays = cat_rays([info.sup_rays for info in self.sup_infos])
         self.all_sup_distances = torch.cat([info.sup_distances for info in self.sup_infos], 0)
         self.all_sup_normals = torch.cat([info.sup_normals for info in self.sup_infos], 0)
-

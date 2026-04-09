@@ -28,6 +28,7 @@ from modules.geo_predictors.PanoFusionDistancePredictor import PanoFusionDistanc
 from modules.inpainters import PanoPersFusionInpainter
 from modules.geo_predictors import PanoJointPredictor
 from modules.mesh_fusion.sup_info import SupInfoPool
+from modules.ambiguity import AmbiguityManager
 from kornia.morphology import erosion, dilation
 from scene.arguments import GSParams, CameraParams
 from scene import Scene, GaussianModel
@@ -77,6 +78,10 @@ class Pano2RoomPipeline(torch.nn.Module):
 
         self.world_to_cam = torch.eye(4, dtype=torch.float32, device=self.device)
         self.cubemap_w2c_list = functions.get_cubemap_views_world_to_cam()
+
+        self.ambiguity_manager = AmbiguityManager(max_regions=3)
+        self.clarification_constraints = None
+        self.clarification_constraints_path = None
 
         self.load_modules()
 
@@ -500,7 +505,59 @@ class Pano2RoomPipeline(torch.nn.Module):
         depth_edge_pil = Image.fromarray(depth_edge)
         depth_pil = Image.fromarray(visualize_depth_numpy(init_depth.cpu().detach().numpy())[0].astype(np.uint8))
         _, _ = save_rgbd(depth_pil, depth_edge_pil, f'depth_edge', 0, self.save_path)  
-        depth_edge_inpaint_mask = ~(torch.from_numpy(depth_edge).cuda().bool()) 
+        depth_edge_tensor = torch.from_numpy(depth_edge).cuda().bool()
+        depth_edge_inpaint_mask = ~depth_edge_tensor
+
+        # ===== Ambiguity-triggered clarification MVP (before first meshing) =====
+        ambiguity_info = self.ambiguity_manager.detect_initial_ambiguity(
+            pano_rgb=panorama_tensor,
+            init_depth=init_depth,
+            depth_edges=depth_edge,
+            sup_pool=None,
+        )
+        ambiguity_map = ambiguity_info["ambiguity_map"]
+        region_proposals = ambiguity_info["region_proposals"]
+        queries = self.ambiguity_manager.build_queries(region_proposals)
+
+        ambiguity_heat = (ambiguity_map * 255).astype(np.uint8)
+        ambiguity_heat = cv2.applyColorMap(ambiguity_heat, cv2.COLORMAP_TURBO)
+        cv2.imwrite(f"{self.save_path}/ambiguity_heatmap.png", ambiguity_heat)
+
+        overlay = (panorama_tensor.permute(1, 2, 0).detach().cpu().numpy() * 255).astype(np.uint8)
+        for proposal in region_proposals:
+            x0, y0, x1, y1 = proposal["bbox"]
+            cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 80, 80), 2)
+            cv2.putText(
+                overlay,
+                f"{proposal['region_id']}:{proposal['score']:.2f}",
+                (x0, max(20, y0 + 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+        cv2.imwrite(f"{self.save_path}/ambiguity_regions_overlay.png", overlay[:, :, ::-1])
+        self.ambiguity_manager.export_queries_json(queries, f"{self.save_path}/clarification_queries.json")
+
+        constraints_input = self.clarification_constraints_path or self.clarification_constraints
+        constraints = self.ambiguity_manager.load_constraints(constraints_input)
+        if len(constraints) > 0:
+            constrained = self.ambiguity_manager.apply_constraints(
+                init_depth=init_depth,
+                depth_edges=depth_edge_tensor,
+                mesh_mask=depth_edge_inpaint_mask,
+                constraints=constraints,
+                pano_rgb=panorama_tensor,
+            )
+            init_depth = constrained["depth"]
+            depth_edge_tensor = constrained["depth_edges"]
+            depth_edge_inpaint_mask = constrained["mesh_mask"]
+            if constrained["debug_overlay"] is not None:
+                cv2.imwrite(
+                    f"{self.save_path}/applied_constraints_overlay.png",
+                    constrained["debug_overlay"][:, :, ::-1],
+                )
 
         self.sup_pool = SupInfoPool()
         self.sup_pool.register_sup_info(pose=torch.eye(4).cuda(),
@@ -613,6 +670,7 @@ if __name__ == "__main__":
     parser.add_argument("--room_scale", type=float, default=0.6)
     parser.add_argument("--offset_x", type=float, default=-0.2)
     parser.add_argument("--offset_z", type=float, default=0.3)
+    parser.add_argument("--clarification_json", type=str, default="", help="Optional path to clarification constraints JSON.")
     args = parser.parse_args()
 
     pipeline = Pano2RoomPipeline(attempt_idx=args.attempt_idx)
@@ -623,6 +681,7 @@ if __name__ == "__main__":
     pipeline.save_details = args.save_details
     pipeline.pose_scale = args.room_scale
     pipeline.pano_center_offset = (args.offset_x, args.offset_z)
+    pipeline.clarification_constraints_path = args.clarification_json if args.clarification_json else None
     
     # Inject resolution and dynamically resize the canvas tensors
     pipeline.H = args.resolution

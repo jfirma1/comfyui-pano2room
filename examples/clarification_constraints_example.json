@@ -1,0 +1,23 @@
+{
+  "schema_version": "0.1",
+  "constraints": [
+    {
+      "region_id": "region_1",
+      "constraint_type": "flat_wall",
+      "confidence": 0.8,
+      "bbox": [320, 180, 610, 410],
+      "metadata": {
+        "note": "likely plain wall patch"
+      }
+    },
+    {
+      "region_id": "region_2",
+      "constraint_type": "opening",
+      "confidence": 0.9,
+      "bbox": [910, 160, 1140, 420],
+      "metadata": {
+        "note": "door/window opening"
+      }
+    }
+  ]
+}
