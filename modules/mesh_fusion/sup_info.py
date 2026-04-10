@@ -73,13 +73,14 @@ class PanoSupInfo(SupInfo):
 
         x_laplacian = kornia.filters.laplacian(distance_map[None].permute(0, 3, 1, 2), kernel_size=3)
         edge_mask = (x_laplacian.abs() < 0.01).float()
-        edge_mask = erosion(edge_mask, kernel=torch.ones(3, 3))
-        edge_mask = dilation(edge_mask, kernel=torch.ones(3, 3))
+        morph_kernel = torch.ones(3, 3, device=edge_mask.device, dtype=edge_mask.dtype)
+        edge_mask = erosion(edge_mask, kernel=morph_kernel)
+        edge_mask = dilation(edge_mask, kernel=morph_kernel)
 
         mask = mask & (edge_mask[0] > .5).permute(1, 2, 0)
 
         if has_normal_map:
-            pano_dirs = -img_coord_to_pano_direction(img_coord_from_hw(height, width))
+            pano_dirs = -img_coord_to_pano_direction(img_coord_from_hw(height, width)).to(normal_map.device)
             normal_cos = (pano_dirs * normal_map).sum(-1, True).clip(0., 1.)
             mask = mask & (normal_cos > 0.15)
 
@@ -339,4 +340,3 @@ class SupInfoPool:
         self.all_sup_rays = cat_rays([info.sup_rays for info in self.sup_infos])
         self.all_sup_distances = torch.cat([info.sup_distances for info in self.sup_infos], 0)
         self.all_sup_normals = torch.cat([info.sup_normals for info in self.sup_infos], 0)
-
