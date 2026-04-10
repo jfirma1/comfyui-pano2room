@@ -300,6 +300,42 @@ def _load_optional_image(path):
     return torch.from_numpy(blank).unsqueeze(0)
 
 
+def _image_path_to_comfy_tensor(path, label="image", required=False, debug=True):
+    if not path:
+        msg = f"[Pano2Room] Missing {label} path in probe payload."
+        if required:
+            raise ValueError(msg)
+        print(msg)
+        return _load_optional_image("")
+
+    if not os.path.exists(path):
+        msg = f"[Pano2Room] {label} file does not exist: {path}"
+        if required:
+            raise FileNotFoundError(msg)
+        print(msg)
+        return _load_optional_image("")
+
+    try:
+        pil_img = Image.open(path).convert("RGB")
+    except Exception as e:
+        msg = f"[Pano2Room] Failed to open {label} image '{path}': {e}"
+        if required:
+            raise ValueError(msg) from e
+        print(msg)
+        return _load_optional_image("")
+
+    arr = np.array(pil_img).astype(np.float32) / 255.0
+    tensor = torch.from_numpy(arr).unsqueeze(0)  # [1, H, W, 3]
+    if debug:
+        t_min = float(tensor.min().item()) if tensor.numel() else 0.0
+        t_max = float(tensor.max().item()) if tensor.numel() else 0.0
+        print(
+            f"[Pano2Room] Loaded {label}: path={path}, arr_shape={arr.shape}, "
+            f"tensor_shape={tuple(tensor.shape)}, dtype={tensor.dtype}, min={t_min:.6f}, max={t_max:.6f}"
+        )
+    return tensor
+
+
 def _parse_query_payload(query_json):
     if not query_json or not query_json.strip():
         return {"queries": []}
@@ -437,8 +473,18 @@ class Pano2RoomAmbiguityProbe(Pano2RoomNode):
         stdout = self._run_script("pano2room.py", gpu_id=gpu_id, desc="Pano2Room Ambiguity Probe", extra_args=probe_args)
         payload = _parse_last_json_line(stdout)
 
-        heatmap = _load_optional_image(payload.get("ambiguity_heatmap_path"))
-        overlay = _load_optional_image(payload.get("ambiguity_overlay_path"))
+        heatmap = _image_path_to_comfy_tensor(
+            payload.get("ambiguity_heatmap_path"),
+            label="ambiguity_heatmap",
+            required=True,
+            debug=True,
+        )
+        overlay = _image_path_to_comfy_tensor(
+            payload.get("ambiguity_overlay_path"),
+            label="ambiguity_overlay",
+            required=True,
+            debug=True,
+        )
         pano_preview = panorama
         query_payload = payload.get("queries", {"queries": []})
         query_json = json.dumps(query_payload, indent=2)
