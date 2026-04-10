@@ -12,6 +12,7 @@ class RegionProposal:
     bbox: List[int]
     score: float
     reasons: Dict[str, float]
+    debug: Optional[Dict] = None
 
 
 @dataclass
