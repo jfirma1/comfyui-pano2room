@@ -47,8 +47,9 @@ from random import randint
 
 @torch.no_grad()
 class Pano2RoomPipeline(torch.nn.Module):
-    def __init__(self, attempt_idx=""):
+    def __init__(self, attempt_idx="", mode="full"):
         super().__init__()
+        self.mode = mode
 
         # renderer setting
         self.blur_radius = 0
@@ -87,11 +88,50 @@ class Pano2RoomPipeline(torch.nn.Module):
         self.world_to_cam = torch.eye(4, dtype=torch.float32, device=self.device)
         self.cubemap_w2c_list = functions.get_cubemap_views_world_to_cam()
 
-        self.load_modules()
+        self.inpainter = None
+        self.geo_predictor = None
+        self.load_modules_for_mode()
 
-    def load_modules(self):
-        self.inpainter = PanoPersFusionInpainter(save_path=self.save_path)
-        self.geo_predictor = PanoJointPredictor(save_path=self.save_path)
+    def load_modules_for_mode(self):
+        if self.mode in ["full", "resume"]:
+            self.ensure_geo_predictor_loaded()
+            # Keep full/resume behavior compatible by loading inpainter eagerly.
+            self.ensure_inpainter_loaded()
+        elif self.mode == "probe":
+            # Probe mode intentionally avoids inpainting stack and predictors only needed post-probe.
+            return
+        else:
+            raise ValueError(f"Unsupported mode: {self.mode}")
+
+    def ensure_geo_predictor_loaded(self):
+        if self.geo_predictor is None:
+            self.geo_predictor = PanoJointPredictor(save_path=self.save_path)
+        return self.geo_predictor
+
+    def _validate_lama_checkpoints(self):
+        expected_files = [
+            "./checkpoints/big-lama-config.yaml",
+            "./checkpoints/big-lama.ckpt",
+        ]
+        missing = [p for p in expected_files if not os.path.exists(p)]
+        if missing:
+            missing_bullet = "\n".join([f"  - {p}" for p in missing])
+            expected_bullet = "\n".join([f"  - {p}" for p in expected_files])
+            raise RuntimeError(
+                "Missing LaMa checkpoint files required for inpainting in full/resume mode.\n"
+                "Expected files:\n"
+                f"{expected_bullet}\n"
+                "Expected path: ./checkpoints/\n"
+                "Missing files:\n"
+                f"{missing_bullet}\n"
+                "Probe mode (--mode probe) does not require LaMa."
+            )
+
+    def ensure_inpainter_loaded(self):
+        if self.inpainter is None:
+            self._validate_lama_checkpoints()
+            self.inpainter = PanoPersFusionInpainter(save_path=self.save_path)
+        return self.inpainter
 
     def project(self, world_to_cam):
         # project mesh into pose and render (rgb, depth, mask)
@@ -296,6 +336,8 @@ class Pano2RoomPipeline(torch.nn.Module):
 
     def inpaint_new_panorama(self, idx, colors, distances, pano_mask):
         print(f"inpaint_new_panorama")
+        self.ensure_inpainter_loaded()
+        self.ensure_geo_predictor_loaded()
 
         # must dilate mask first
         mask = pano_mask.unsqueeze(-1)
@@ -753,7 +795,7 @@ if __name__ == "__main__":
     parser.add_argument("--offset_z", type=float, default=0.3)
     args = parser.parse_args()
 
-    pipeline = Pano2RoomPipeline(attempt_idx=args.attempt_idx)
+    pipeline = Pano2RoomPipeline(attempt_idx=args.attempt_idx, mode=args.mode)
     
     # Inject the settings from ComfyUI
     pipeline.inpaint_frame_stride = args.inpaint_stride
