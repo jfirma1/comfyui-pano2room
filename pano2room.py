@@ -392,7 +392,13 @@ class Pano2RoomPipeline(torch.nn.Module):
         return panorama_tensor, depth# panorama_tensor:BCHW, depth:HW
 
     def load_camera_poses(self, pano_center_offset=[0,0]):
-        subset_path = f'input/Camera_Trajectory' # initial 6 poses are cubemaps poses
+        subset_path = self._camera_trajectory_path() # initial 6 poses are cubemaps poses
+        if not os.path.isdir(subset_path):
+            raise FileNotFoundError(
+                f"Camera trajectory directory not found: {subset_path}. "
+                "Full generation requires camera_pose*.txt files. "
+                "Probe mode can run without this directory."
+            )
         files = os.listdir(subset_path)
 
         self.scene_depth_max = 4.0228885328450446
@@ -571,9 +577,36 @@ class Pano2RoomPipeline(torch.nn.Module):
         os.makedirs(folder, exist_ok=True)
         return folder
 
+    def _camera_trajectory_path(self):
+        return "input/Camera_Trajectory"
+
+    def _build_default_probe_poses(self):
+        """
+        Probe-only fallback when trajectory assets are unavailable.
+        Uses identity pano pose plus cubemap anchor poses so we can persist a
+        valid resume payload without depending on demo trajectory files.
+        """
+        pano_pose_44 = np.eye(4, dtype=float)
+        poses = [pose.clone().float().cpu() for pose in self.cubemap_w2c_list]
+        self.scene_depth_max = 4.0228885328450446
+        return pano_pose_44, poses
+
     def prepare_ambiguity_probe(self, state_dir=None):
         torch.set_default_tensor_type('torch.cuda.FloatTensor')
-        self.pano_pose, self.poses = self.load_camera_poses(self.pano_center_offset)
+        trajectory_path = self._camera_trajectory_path()
+        if self.mode == "probe":
+            if os.path.isdir(trajectory_path):
+                self.pano_pose, self.poses = self.load_camera_poses(self.pano_center_offset)
+            else:
+                self.pano_pose, self.poses = self._build_default_probe_poses()
+        else:
+            if not os.path.isdir(trajectory_path):
+                raise FileNotFoundError(
+                    "Missing camera trajectory assets required for full generation mode.\n"
+                    f"Expected directory: {trajectory_path}\n"
+                    "Use --mode probe to generate ambiguity artifacts without trajectory files."
+                )
+            self.pano_pose, self.poses = self.load_camera_poses(self.pano_center_offset)
         pano_rgb, pano_depth = self.load_pano()
         panorama_tensor, init_depth = pano_rgb.squeeze(0).cuda(), pano_depth.cuda()
 
