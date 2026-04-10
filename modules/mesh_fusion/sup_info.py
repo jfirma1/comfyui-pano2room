@@ -93,8 +93,10 @@ class PanoSupInfo(SupInfo):
 
     def update_sup_info(self):
         pose, height, width = self.pose, self.height, self.width
-        img_coords = torch.meshgrid(torch.linspace(.5 / height, 1. - .5 / height, height),
-                                    torch.linspace(.5 / width,  1. - .5 / width,  width),
+        device = pose.device
+        dtype = pose.dtype
+        img_coords = torch.meshgrid(torch.linspace(.5 / height, 1. - .5 / height, height, device=device, dtype=dtype),
+                                    torch.linspace(.5 / width,  1. - .5 / width,  width, device=device, dtype=dtype),
                                     indexing='ij')
         dirs = img_coord_to_pano_direction(torch.stack(img_coords, -1))
         dirs = apply_rot(dirs, self.pose[:3, :3])
