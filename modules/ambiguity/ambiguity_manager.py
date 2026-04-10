@@ -16,6 +16,15 @@ class AmbiguityManager:
         near_duplicate_score_delta: float = 0.04,
         diversity_radius_ratio: float = 0.22,
         diversity_penalty: float = 0.20,
+        cluster_suppression_radius_ratio: float = 0.18,
+        cluster_overlap_threshold: float = 0.10,
+        distinct_area_scale_ratio: float = 1.80,
+        distinct_structural_priority_delta: float = 0.20,
+        distinct_edge_behavior_delta: float = 0.18,
+        weak_low_texture_threshold: float = 0.72,
+        weak_edge_instability_threshold: float = 0.12,
+        weak_disagreement_threshold: float = 0.12,
+        weak_structural_priority_threshold: float = 0.28,
     ):
         self.top_k = max(1, min(3, top_k))
         self.nms_iou_threshold = float(nms_iou_threshold)
@@ -23,6 +32,15 @@ class AmbiguityManager:
         self.near_duplicate_score_delta = float(near_duplicate_score_delta)
         self.diversity_radius_ratio = float(diversity_radius_ratio)
         self.diversity_penalty = float(diversity_penalty)
+        self.cluster_suppression_radius_ratio = float(cluster_suppression_radius_ratio)
+        self.cluster_overlap_threshold = float(cluster_overlap_threshold)
+        self.distinct_area_scale_ratio = float(distinct_area_scale_ratio)
+        self.distinct_structural_priority_delta = float(distinct_structural_priority_delta)
+        self.distinct_edge_behavior_delta = float(distinct_edge_behavior_delta)
+        self.weak_low_texture_threshold = float(weak_low_texture_threshold)
+        self.weak_edge_instability_threshold = float(weak_edge_instability_threshold)
+        self.weak_disagreement_threshold = float(weak_disagreement_threshold)
+        self.weak_structural_priority_threshold = float(weak_structural_priority_threshold)
 
     def _norm(self, x: np.ndarray) -> np.ndarray:
         x = x.astype(np.float32)
@@ -162,13 +180,16 @@ class AmbiguityManager:
         pre_nms_count = len(ranked_candidates)
         nms_regions = self._suppress_duplicates(ranked_candidates, image_w=image_w, image_h=image_h)
         post_nms_count = len(nms_regions)
-        selected = self._select_diverse_topk(nms_regions, image_w=image_w, image_h=image_h)
+        selected, rejected = self._select_final_topk(nms_regions, image_w=image_w, image_h=image_h)
 
         for idx, proposal in enumerate(selected):
             proposal.region_id = f"r{idx + 1}"
             proposal.debug = proposal.debug or {}
             proposal.debug["pre_nms_candidate_count"] = pre_nms_count
             proposal.debug["post_nms_candidate_count"] = post_nms_count
+            proposal.debug["rejected_candidate_count"] = len(rejected)
+
+        self._last_rejected_candidates = rejected
         return selected
 
     def _compute_reason_terms(
@@ -248,6 +269,56 @@ class AmbiguityManager:
         x1, y1, x2, y2 = proposal.bbox
         return (0.5 * (x1 + x2), 0.5 * (y1 + y2))
 
+    def _bbox_intersection_over_min_area(self, a: List[int], b: List[int]) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        inter_x1, inter_y1 = max(ax1, bx1), max(ay1, by1)
+        inter_x2, inter_y2 = min(ax2, bx2), min(ay2, by2)
+        iw = max(0, inter_x2 - inter_x1)
+        ih = max(0, inter_y2 - inter_y1)
+        inter = float(iw * ih)
+        if inter <= 0:
+            return 0.0
+        area_a = float(max(1, ax2 - ax1) * max(1, ay2 - ay1))
+        area_b = float(max(1, bx2 - bx1) * max(1, by2 - by1))
+        return inter / max(min(area_a, area_b), 1e-6)
+
+    def _is_weak_low_structure_region(self, proposal: RegionProposal) -> bool:
+        reasons = proposal.reasons or {}
+        low_texture = float(reasons.get("low_texture", 0.0))
+        edge_instability = float(reasons.get("edge_instability", 0.0))
+        disagreement = float(reasons.get("smoothness_edge_disagreement", 0.0))
+        structural_priority = float(reasons.get("structural_priority", 0.0))
+        return (
+            low_texture >= self.weak_low_texture_threshold
+            and edge_instability <= self.weak_edge_instability_threshold
+            and disagreement <= self.weak_disagreement_threshold
+            and structural_priority <= self.weak_structural_priority_threshold
+        )
+
+    def _is_materially_distinct(self, candidate: RegionProposal, selected: RegionProposal) -> bool:
+        c_reasons = candidate.reasons or {}
+        s_reasons = selected.reasons or {}
+        c_area = float(c_reasons.get("normalized_area", 0.0))
+        s_area = float(s_reasons.get("normalized_area", 0.0))
+        area_scale = max(c_area, s_area) / max(min(c_area, s_area), 1e-6)
+        structural_delta = abs(
+            float(c_reasons.get("structural_priority", 0.0)) - float(s_reasons.get("structural_priority", 0.0))
+        )
+        edge_delta = max(
+            abs(float(c_reasons.get("edge_instability", 0.0)) - float(s_reasons.get("edge_instability", 0.0))),
+            abs(
+                float(c_reasons.get("smoothness_edge_disagreement", 0.0))
+                - float(s_reasons.get("smoothness_edge_disagreement", 0.0))
+            ),
+            abs(float(c_reasons.get("curvature_in_low_texture", 0.0)) - float(s_reasons.get("curvature_in_low_texture", 0.0))),
+        )
+        return (
+            area_scale >= self.distinct_area_scale_ratio
+            or structural_delta >= self.distinct_structural_priority_delta
+            or edge_delta >= self.distinct_edge_behavior_delta
+        )
+
     def _suppress_duplicates(self, ranked_candidates: List[RegionProposal], image_w: int, image_h: int) -> List[RegionProposal]:
         kept: List[RegionProposal] = []
         diag = float(np.hypot(image_w, image_h))
@@ -278,41 +349,100 @@ class AmbiguityManager:
                 kept.append(candidate)
         return kept
 
-    def _select_diverse_topk(self, candidates: List[RegionProposal], image_w: int, image_h: int) -> List[RegionProposal]:
-        if len(candidates) <= self.top_k:
-            for candidate in candidates:
-                candidate.debug = candidate.debug or {}
-                candidate.debug["diversity_penalty"] = 0.0
-                candidate.debug["final_score"] = candidate.score
-            return candidates[: self.top_k]
-
+    def _select_final_topk(
+        self, candidates: List[RegionProposal], image_w: int, image_h: int
+    ) -> Tuple[List[RegionProposal], List[Dict]]:
         diag = float(np.hypot(image_w, image_h))
-        radius = self.diversity_radius_ratio * diag
+        diversity_radius = self.diversity_radius_ratio * diag
+        cluster_radius = self.cluster_suppression_radius_ratio * diag
         selected: List[RegionProposal] = []
-        remaining = list(candidates)
+        rejected: List[Dict] = []
+        cluster_count = 0
 
-        while remaining and len(selected) < self.top_k:
-            best_idx = 0
-            best_score = -1e9
-            for idx, candidate in enumerate(remaining):
-                cx, cy = self._proposal_center(candidate)
-                min_dist = min((np.hypot(cx - sx, cy - sy) for sx, sy in [self._proposal_center(p) for p in selected]), default=diag)
-                diversity_penalty = self.diversity_penalty * max(0.0, 1.0 - (min_dist / max(radius, 1e-6)))
-                final_score = float(candidate.score - diversity_penalty)
-                if final_score > best_score:
-                    best_score = final_score
-                    best_idx = idx
-            chosen = remaining.pop(best_idx)
-            cx, cy = self._proposal_center(chosen)
-            min_dist = min((np.hypot(cx - sx, cy - sy) for sx, sy in [self._proposal_center(p) for p in selected]), default=diag)
-            diversity_penalty = self.diversity_penalty * max(0.0, 1.0 - (min_dist / max(radius, 1e-6)))
-            chosen.debug = chosen.debug or {}
-            chosen.debug["diversity_penalty"] = float(diversity_penalty)
-            chosen.debug["final_score"] = float(chosen.score - diversity_penalty)
-            chosen.debug["diversity_radius"] = float(radius)
-            chosen.debug["min_distance_to_selected"] = float(min_dist)
-            selected.append(chosen)
-        return selected
+        ranked = sorted(
+            candidates,
+            key=lambda c: (
+                float(c.score),
+                float((c.reasons or {}).get("structural_priority", 0.0)),
+                float((c.reasons or {}).get("edge_instability", 0.0))
+                + float((c.reasons or {}).get("smoothness_edge_disagreement", 0.0)),
+            ),
+            reverse=True,
+        )
+
+        for candidate in ranked:
+            if len(selected) >= self.top_k:
+                rejected.append(
+                    {
+                        "region_id": candidate.region_id,
+                        "inclusion_reason": "rejected_topk_limit",
+                    }
+                )
+                continue
+
+            cx, cy = self._proposal_center(candidate)
+            nearest = None
+            min_dist = diag
+            for proposal in selected:
+                px, py = self._proposal_center(proposal)
+                dist = float(np.hypot(cx - px, cy - py))
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest = proposal
+
+            if self._is_weak_low_structure_region(candidate):
+                rejected.append(
+                    {
+                        "region_id": candidate.region_id,
+                        "nearest_selected_region_id": nearest.region_id if nearest else None,
+                        "cluster_id": (nearest.debug or {}).get("cluster_id") if nearest else None,
+                        "inclusion_reason": "rejected_low_structure",
+                    }
+                )
+                continue
+
+            overlap_with_nearest = (
+                self._bbox_intersection_over_min_area(candidate.bbox, nearest.bbox) if nearest is not None else 0.0
+            )
+            near_cluster = (
+                nearest is not None and min_dist <= cluster_radius and overlap_with_nearest >= self.cluster_overlap_threshold
+            )
+
+            if near_cluster and not self._is_materially_distinct(candidate, nearest):
+                rejected.append(
+                    {
+                        "region_id": candidate.region_id,
+                        "nearest_selected_region_id": nearest.region_id,
+                        "cluster_id": (nearest.debug or {}).get("cluster_id"),
+                        "center_distance_to_nearest": float(min_dist),
+                        "overlap_to_nearest": float(overlap_with_nearest),
+                        "inclusion_reason": "rejected_near_duplicate",
+                    }
+                )
+                continue
+
+            diversity_penalty = self.diversity_penalty * max(0.0, 1.0 - (min_dist / max(diversity_radius, 1e-6)))
+            final_score = float(candidate.score - diversity_penalty)
+            candidate.debug = candidate.debug or {}
+            candidate.debug["survived_cluster_suppression"] = True
+            candidate.debug["passed_weak_structure_rejection"] = True
+            candidate.debug["cluster_radius"] = float(cluster_radius)
+            candidate.debug["cluster_overlap_threshold"] = float(self.cluster_overlap_threshold)
+            candidate.debug["diversity_radius"] = float(diversity_radius)
+            candidate.debug["min_distance_to_selected"] = float(min_dist)
+            candidate.debug["diversity_penalty"] = float(diversity_penalty)
+            candidate.debug["final_score"] = final_score
+            candidate.debug["nearest_selected_region_id"] = nearest.region_id if nearest else None
+            if near_cluster:
+                candidate.debug["cluster_id"] = (nearest.debug or {}).get("cluster_id")
+                candidate.debug["inclusion_reason"] = "selected_structural_diversity"
+            else:
+                cluster_count += 1
+                candidate.debug["cluster_id"] = f"c{cluster_count}"
+                candidate.debug["inclusion_reason"] = "selected_primary_in_cluster"
+            selected.append(candidate)
+
+        return selected, rejected
 
     def _make_overlay(self, pano_rgb: np.ndarray, heatmap_rgb: np.ndarray, proposals: List[RegionProposal]) -> np.ndarray:
         base = (np.clip(pano_rgb, 0, 1) * 255).astype(np.uint8)
@@ -339,7 +469,7 @@ class AmbiguityManager:
                     "debug": debug_payload,
                 }
             )
-        return {"queries": queries}
+        return {"queries": queries, "rejected_candidates": getattr(self, "_last_rejected_candidates", [])}
 
 
 def dump_queries_json(path: str, queries: Dict) -> None:
