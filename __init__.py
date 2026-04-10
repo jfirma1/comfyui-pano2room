@@ -32,6 +32,7 @@ import shutil
 import glob
 import subprocess
 import json
+import re
 import numpy as np
 import torch
 from PIL import Image
@@ -299,6 +300,78 @@ def _load_optional_image(path):
     return torch.from_numpy(blank).unsqueeze(0)
 
 
+def _parse_query_payload(query_json):
+    if not query_json or not query_json.strip():
+        return {"queries": []}
+    parsed = json.loads(query_json)
+    if isinstance(parsed, list):
+        return {"queries": parsed}
+    if not isinstance(parsed, dict):
+        raise ValueError("query_json must be a JSON object or list.")
+    return parsed
+
+
+def _format_bbox(bbox):
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return "bbox=unknown"
+    try:
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        return f"bbox=[{x1}, {y1}, {x2}, {y2}]"
+    except Exception:
+        return "bbox=unknown"
+
+
+def _format_query_questions(query_payload):
+    queries = query_payload.get("queries", [])
+    if not queries:
+        return "No clarification questions found."
+
+    blocks = []
+    for i, q in enumerate(queries, start=1):
+        region_id = str(q.get("region_id", f"r{i}"))
+        question = str(q.get("question", "How should this ambiguous region be interpreted?"))
+        allowed = q.get("allowed_choices", [])
+        if not isinstance(allowed, list) or not allowed:
+            allowed = ["flat_wall", "sharp_corner", "same_surface", "opening", "unknown"]
+        choices = ", ".join([str(c) for c in allowed])
+        bbox_text = _format_bbox(q.get("bbox"))
+        blocks.append(
+            f"Question {i} (region {region_id}, {bbox_text}):\n"
+            f"{question}\n"
+            f"Choices: {choices}"
+        )
+    return "\n\n".join(blocks)
+
+
+def _allowed_choice_map(query_payload):
+    choices_by_region = {}
+    default_choices = set(["flat_wall", "sharp_corner", "same_surface", "opening", "unknown"])
+    for q in query_payload.get("queries", []):
+        region_id = str(q.get("region_id", "")).strip()
+        if not region_id:
+            continue
+        allowed = q.get("allowed_choices", [])
+        if isinstance(allowed, list) and allowed:
+            choices_by_region[region_id] = set([str(c).strip() for c in allowed if str(c).strip()])
+        else:
+            choices_by_region[region_id] = set(default_choices)
+    return choices_by_region, default_choices
+
+
+def _parse_line_answers(answer_text):
+    answers = []
+    for raw_line in (answer_text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.match(r"^([^=:\s]+)\s*(=|:)\s*([^\s]+)\s*$", line)
+        if not match:
+            raise ValueError(f"Invalid answer line '{raw_line}'. Expected format like r1=unknown.")
+        region_id, _, answer = match.groups()
+        answers.append({"region_id": region_id.strip(), "answer": answer.strip()})
+    return {"answers": answers}
+
+
 # ---------------------------------------------------------------------------
 # Node 2: Pano2Room PLY Loader — Load the output GS PLY for downstream use
 # ---------------------------------------------------------------------------
@@ -337,8 +410,8 @@ class Pano2RoomAmbiguityProbe(Pano2RoomNode):
         base["optional"]["state_dir"] = ("STRING", {"default": "", "multiline": False})
         return base
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("ambiguity_heatmap", "ambiguity_overlay", "query_json", "state_path", "status")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("heatmap_image", "overlay_image", "pano_preview_image", "state_path", "query_json", "question_text", "status")
     FUNCTION = "run_probe"
     CATEGORY = "3D/Pano2Room"
 
@@ -366,10 +439,97 @@ class Pano2RoomAmbiguityProbe(Pano2RoomNode):
 
         heatmap = _load_optional_image(payload.get("ambiguity_heatmap_path"))
         overlay = _load_optional_image(payload.get("ambiguity_overlay_path"))
-        query_json = json.dumps(payload.get("queries", {"queries": []}), indent=2)
+        pano_preview = panorama
+        query_payload = payload.get("queries", {"queries": []})
+        query_json = json.dumps(query_payload, indent=2)
+        question_text = _format_query_questions(query_payload)
         state_path = payload.get("state_path", "")
-        status = "probe_complete" if state_path else "probe_failed"
-        return (heatmap, overlay, query_json, state_path, status)
+        status = (
+            "Probe complete. Review heatmap and overlay, answer questions, then pass state_path + answer_json into Resume."
+            if state_path
+            else "Probe failed. Check node logs for errors."
+        )
+        return (heatmap, overlay, pano_preview, state_path, query_json, question_text, status)
+
+
+class Pano2RoomQueryViewer:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "query_json": ("STRING", {"default": "{\"queries\": []}", "multiline": True}),
+            },
+            "optional": {
+                "overlay_image": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "IMAGE", "STRING")
+    RETURN_NAMES = ("formatted_questions", "overlay_image", "status")
+    FUNCTION = "format_queries"
+    CATEGORY = "3D/Pano2Room"
+
+    def format_queries(self, query_json, overlay_image=None):
+        payload = _parse_query_payload(query_json)
+        formatted = _format_query_questions(payload)
+        out_overlay = overlay_image if overlay_image is not None else _load_optional_image("")
+        status = f"Loaded {len(payload.get('queries', []))} clarification question(s)."
+        return (formatted, out_overlay, status)
+
+
+class Pano2RoomAnswerBuilder:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "query_json": ("STRING", {"default": "{\"queries\": []}", "multiline": True}),
+                "answer_text": ("STRING", {"default": "", "multiline": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("answer_json", "status")
+    FUNCTION = "build_answers"
+    CATEGORY = "3D/Pano2Room"
+
+    def build_answers(self, query_json, answer_text):
+        payload = _parse_query_payload(query_json)
+        choices_by_region, default_choices = _allowed_choice_map(payload)
+
+        raw_text = (answer_text or "").strip()
+        if not raw_text:
+            return (json.dumps({"answers": []}, indent=2), "No answers provided. Output contains an empty answers list.")
+
+        try:
+            if raw_text.startswith("{") or raw_text.startswith("["):
+                parsed_answers = json.loads(raw_text)
+                if isinstance(parsed_answers, list):
+                    parsed_answers = {"answers": parsed_answers}
+                if not isinstance(parsed_answers, dict):
+                    raise ValueError("Answer JSON must be an object or list.")
+                answers = parsed_answers.get("answers", [])
+            else:
+                parsed_answers = _parse_line_answers(raw_text)
+                answers = parsed_answers.get("answers", [])
+        except Exception as e:
+            return (json.dumps({"answers": []}, indent=2), f"Failed to parse answers: {e}")
+
+        normalized = []
+        for item in answers:
+            region_id = str(item.get("region_id", "")).strip()
+            answer = str(item.get("answer", "")).strip()
+            if not region_id:
+                continue
+            allowed = choices_by_region.get(region_id, default_choices)
+            if answer not in allowed:
+                return (
+                    json.dumps({"answers": []}, indent=2),
+                    f"Invalid answer '{answer}' for region '{region_id}'. Allowed choices: {', '.join(sorted(allowed))}",
+                )
+            normalized.append({"region_id": region_id, "answer": answer})
+
+        canonical = {"answers": normalized}
+        return (json.dumps(canonical, indent=2), f"Built canonical answer JSON with {len(normalized)} answer(s).")
 
 
 class Pano2RoomResumeFromClarification(Pano2RoomNode):
@@ -413,7 +573,7 @@ class Pano2RoomResumeFromClarification(Pano2RoomNode):
         mesh_candidates = glob.glob(os.path.join(output_dir, "**", "*.obj"), recursive=True)
         if mesh_candidates:
             mesh_path = mesh_candidates[0]
-        return (gs_ply_path, debug_img, mesh_path, "resume_complete")
+        return (gs_ply_path, debug_img, mesh_path, "Resuming reconstruction from saved probe state.")
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +685,8 @@ class Pano2RoomCameraTrajectory:
 NODE_CLASS_MAPPINGS = {
     "Pano2Room": Pano2RoomNode,
     "Pano2RoomAmbiguityProbe": Pano2RoomAmbiguityProbe,
+    "Pano2RoomQueryViewer": Pano2RoomQueryViewer,
+    "Pano2RoomAnswerBuilder": Pano2RoomAnswerBuilder,
     "Pano2RoomResumeFromClarification": Pano2RoomResumeFromClarification,
     "Pano2RoomPLYLoader": Pano2RoomPLYLoader,
     "Pano2RoomCameraTrajectory": Pano2RoomCameraTrajectory,
@@ -533,6 +695,8 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Pano2Room": "Pano2Room (Panorama → 3DGS)",
     "Pano2RoomAmbiguityProbe": "Pano2Room Ambiguity Probe",
+    "Pano2RoomQueryViewer": "Pano2Room Query Viewer",
+    "Pano2RoomAnswerBuilder": "Pano2Room Answer Builder",
     "Pano2RoomResumeFromClarification": "Pano2Room Resume From Clarification",
     "Pano2RoomPLYLoader": "Pano2Room PLY Loader",
     "Pano2RoomCameraTrajectory": "Pano2Room Camera Trajectory",
