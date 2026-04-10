@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -41,6 +42,7 @@ class AmbiguityManager:
         self.weak_edge_instability_threshold = float(weak_edge_instability_threshold)
         self.weak_disagreement_threshold = float(weak_disagreement_threshold)
         self.weak_structural_priority_threshold = float(weak_structural_priority_threshold)
+        self._last_rejected_candidates: List[Dict] = []
 
     def _norm(self, x: np.ndarray) -> np.ndarray:
         x = x.astype(np.float32)
@@ -176,21 +178,33 @@ class AmbiguityManager:
                 )
             )
 
-        ranked_candidates = sorted(regions, key=lambda r: r.score, reverse=True)
-        pre_nms_count = len(ranked_candidates)
-        nms_regions = self._suppress_duplicates(ranked_candidates, image_w=image_w, image_h=image_h)
-        post_nms_count = len(nms_regions)
-        selected, rejected = self._select_final_topk(nms_regions, image_w=image_w, image_h=image_h)
+        raw_candidates = sorted(regions, key=lambda r: r.score, reverse=True)
+        post_nms_candidates, nms_rejected = self._suppress_duplicates(raw_candidates, image_w=image_w, image_h=image_h)
+        post_cluster_candidates, cluster_rejected = self._apply_cluster_suppression(
+            post_nms_candidates, image_w=image_w, image_h=image_h
+        )
+        final_selected, topk_rejected = self._select_final_topk(post_cluster_candidates)
+        self._finalize_selected_metadata(
+            final_selected=final_selected,
+            pre_nms_count=len(raw_candidates),
+            post_nms_count=len(post_nms_candidates),
+            post_cluster_count=len(post_cluster_candidates),
+            rejected_total=len(nms_rejected) + len(cluster_rejected) + len(topk_rejected),
+        )
 
-        for idx, proposal in enumerate(selected):
-            proposal.region_id = f"r{idx + 1}"
-            proposal.debug = proposal.debug or {}
-            proposal.debug["pre_nms_candidate_count"] = pre_nms_count
-            proposal.debug["post_nms_candidate_count"] = post_nms_count
-            proposal.debug["rejected_candidate_count"] = len(rejected)
-
+        rejected = nms_rejected + cluster_rejected + topk_rejected
+        self._validate_selection_bookkeeping(final_selected, rejected)
         self._last_rejected_candidates = rejected
-        return selected
+        return final_selected
+
+    def _clone_proposal(self, proposal: RegionProposal) -> RegionProposal:
+        return RegionProposal(
+            region_id=proposal.region_id,
+            bbox=[int(v) for v in proposal.bbox],
+            score=float(proposal.score),
+            reasons=deepcopy(proposal.reasons or {}),
+            debug=deepcopy(proposal.debug or {}),
+        )
 
     def _compute_reason_terms(
         self,
@@ -319,19 +333,23 @@ class AmbiguityManager:
             or edge_delta >= self.distinct_edge_behavior_delta
         )
 
-    def _suppress_duplicates(self, ranked_candidates: List[RegionProposal], image_w: int, image_h: int) -> List[RegionProposal]:
+    def _suppress_duplicates(
+        self, ranked_candidates: List[RegionProposal], image_w: int, image_h: int
+    ) -> Tuple[List[RegionProposal], List[Dict]]:
         kept: List[RegionProposal] = []
+        rejected: List[Dict] = []
         diag = float(np.hypot(image_w, image_h))
         center_radius = self.near_duplicate_center_radius_ratio * diag
 
         for candidate in ranked_candidates:
+            candidate_copy = self._clone_proposal(candidate)
             suppressed_by: Optional[Dict] = None
-            c_cx, c_cy = self._proposal_center(candidate)
+            c_cx, c_cy = self._proposal_center(candidate_copy)
             for kept_region in kept:
-                iou = self._bbox_iou(candidate.bbox, kept_region.bbox)
+                iou = self._bbox_iou(candidate_copy.bbox, kept_region.bbox)
                 kx, ky = self._proposal_center(kept_region)
                 center_dist = float(np.hypot(c_cx - kx, c_cy - ky))
-                score_gap = abs(float(candidate.score - kept_region.score))
+                score_gap = abs(float(candidate_copy.score - kept_region.score))
                 is_near_duplicate = center_dist <= center_radius and score_gap <= self.near_duplicate_score_delta
                 if iou >= self.nms_iou_threshold or is_near_duplicate:
                     suppressed_by = {
@@ -343,18 +361,33 @@ class AmbiguityManager:
                     }
                     break
 
-            candidate.debug = candidate.debug or {}
-            candidate.debug["suppressed_by"] = suppressed_by
+            candidate_copy.debug = candidate_copy.debug or {}
+            candidate_copy.debug["suppressed_by"] = suppressed_by
+            candidate_copy.debug["selection_stage_trace"] = {
+                "survived_nms": suppressed_by is None,
+                "survived_cluster_suppression": False,
+                "survived_topk": False,
+            }
             if suppressed_by is None:
-                kept.append(candidate)
-        return kept
+                kept.append(candidate_copy)
+            else:
+                rejected.append(
+                    {
+                        "region_id": candidate_copy.region_id,
+                        "rejection_stage": "nms",
+                        "rejection_reason": suppressed_by["reason"],
+                        "suppressing_region_id": suppressed_by["kept_region_id"],
+                        "cluster_id": None,
+                    }
+                )
+        return kept, rejected
 
-    def _select_final_topk(
+    def _apply_cluster_suppression(
         self, candidates: List[RegionProposal], image_w: int, image_h: int
     ) -> Tuple[List[RegionProposal], List[Dict]]:
         diag = float(np.hypot(image_w, image_h))
-        diversity_radius = self.diversity_radius_ratio * diag
         cluster_radius = self.cluster_suppression_radius_ratio * diag
+        diversity_radius = self.diversity_radius_ratio * diag
         selected: List[RegionProposal] = []
         rejected: List[Dict] = []
         cluster_count = 0
@@ -371,15 +404,6 @@ class AmbiguityManager:
         )
 
         for candidate in ranked:
-            if len(selected) >= self.top_k:
-                rejected.append(
-                    {
-                        "region_id": candidate.region_id,
-                        "inclusion_reason": "rejected_topk_limit",
-                    }
-                )
-                continue
-
             cx, cy = self._proposal_center(candidate)
             nearest = None
             min_dist = diag
@@ -394,9 +418,11 @@ class AmbiguityManager:
                 rejected.append(
                     {
                         "region_id": candidate.region_id,
+                        "rejection_stage": "cluster_suppression",
+                        "rejection_reason": "rejected_low_structure",
                         "nearest_selected_region_id": nearest.region_id if nearest else None,
                         "cluster_id": (nearest.debug or {}).get("cluster_id") if nearest else None,
-                        "inclusion_reason": "rejected_low_structure",
+                        "suppressing_region_id": nearest.region_id if nearest else None,
                     }
                 )
                 continue
@@ -412,11 +438,13 @@ class AmbiguityManager:
                 rejected.append(
                     {
                         "region_id": candidate.region_id,
+                        "rejection_stage": "cluster_suppression",
+                        "rejection_reason": "rejected_near_duplicate",
                         "nearest_selected_region_id": nearest.region_id,
                         "cluster_id": (nearest.debug or {}).get("cluster_id"),
                         "center_distance_to_nearest": float(min_dist),
                         "overlap_to_nearest": float(overlap_with_nearest),
-                        "inclusion_reason": "rejected_near_duplicate",
+                        "suppressing_region_id": nearest.region_id,
                     }
                 )
                 continue
@@ -424,6 +452,10 @@ class AmbiguityManager:
             diversity_penalty = self.diversity_penalty * max(0.0, 1.0 - (min_dist / max(diversity_radius, 1e-6)))
             final_score = float(candidate.score - diversity_penalty)
             candidate.debug = candidate.debug or {}
+            stage_trace = candidate.debug.get("selection_stage_trace", {})
+            stage_trace["survived_cluster_suppression"] = True
+            stage_trace["survived_topk"] = False
+            candidate.debug["selection_stage_trace"] = stage_trace
             candidate.debug["survived_cluster_suppression"] = True
             candidate.debug["passed_weak_structure_rejection"] = True
             candidate.debug["cluster_radius"] = float(cluster_radius)
@@ -435,14 +467,98 @@ class AmbiguityManager:
             candidate.debug["nearest_selected_region_id"] = nearest.region_id if nearest else None
             if near_cluster:
                 candidate.debug["cluster_id"] = (nearest.debug or {}).get("cluster_id")
-                candidate.debug["inclusion_reason"] = "selected_structural_diversity"
+                candidate.debug["inclusion_reason"] = "selected_distinct_secondary_region"
+                candidate.debug["cluster_representative_status"] = "secondary"
             else:
                 cluster_count += 1
                 candidate.debug["cluster_id"] = f"c{cluster_count}"
                 candidate.debug["inclusion_reason"] = "selected_primary_in_cluster"
+                candidate.debug["cluster_representative_status"] = "primary"
             selected.append(candidate)
 
         return selected, rejected
+
+    def _select_final_topk(self, candidates: List[RegionProposal]) -> Tuple[List[RegionProposal], List[Dict]]:
+        ranked = sorted(candidates, key=lambda c: float(c.debug.get("final_score", c.score)), reverse=True)
+        final_selected = [self._clone_proposal(c) for c in ranked[: self.top_k]]
+        rejected: List[Dict] = []
+        for candidate in ranked[self.top_k :]:
+            rejected.append(
+                {
+                    "region_id": candidate.region_id,
+                    "rejection_stage": "topk",
+                    "rejection_reason": "rejected_topk_limit",
+                    "cluster_id": (candidate.debug or {}).get("cluster_id"),
+                    "suppressing_region_id": None,
+                }
+            )
+        return final_selected, rejected
+
+    def _finalize_selected_metadata(
+        self,
+        final_selected: List[RegionProposal],
+        pre_nms_count: int,
+        post_nms_count: int,
+        post_cluster_count: int,
+        rejected_total: int,
+    ) -> None:
+        final_ids = [proposal.region_id for proposal in final_selected]
+        for rank, proposal in enumerate(final_selected, start=1):
+            proposal.debug = proposal.debug or {}
+            proposal.debug["final_selection_rank"] = rank
+            proposal.debug["pre_nms_candidate_count"] = pre_nms_count
+            proposal.debug["post_nms_candidate_count"] = post_nms_count
+            proposal.debug["post_cluster_candidate_count"] = post_cluster_count
+            proposal.debug["rejected_candidate_count"] = rejected_total
+
+            nearest_id = None
+            nearest_dist = None
+            cx, cy = self._proposal_center(proposal)
+            for other in final_selected:
+                if other.region_id == proposal.region_id:
+                    continue
+                ox, oy = self._proposal_center(other)
+                dist = float(np.hypot(cx - ox, cy - oy))
+                if nearest_dist is None or dist < nearest_dist:
+                    nearest_dist = dist
+                    nearest_id = other.region_id
+
+            proposal.debug["nearest_selected_region_id"] = nearest_id
+            proposal.debug["nearest_selected_distance"] = nearest_dist
+            proposal.debug["nearest_selected_comparison_ids"] = [rid for rid in final_ids if rid != proposal.region_id]
+            stage_trace = proposal.debug.get("selection_stage_trace", {})
+            stage_trace["survived_nms"] = True
+            stage_trace["survived_cluster_suppression"] = True
+            stage_trace["survived_topk"] = True
+            proposal.debug["selection_stage_trace"] = stage_trace
+
+    def _validate_selection_bookkeeping(self, final_selected: List[RegionProposal], rejected: List[Dict]) -> None:
+        final_ids = [p.region_id for p in final_selected]
+        rejected_ids = [str(r.get("region_id")) for r in rejected if r.get("region_id")]
+
+        if len(final_ids) != len(set(final_ids)):
+            raise ValueError("Duplicate region ids detected in final selected set.")
+        if len(rejected_ids) != len(set(rejected_ids)):
+            raise ValueError("Duplicate region ids detected in rejected candidate set.")
+        overlap = set(final_ids).intersection(rejected_ids)
+        if overlap:
+            raise ValueError(f"Selected/rejected region id overlap detected: {sorted(overlap)}")
+
+        cluster_primary_count: Dict[str, int] = {}
+        for proposal in final_selected:
+            debug = proposal.debug or {}
+            cluster_id = debug.get("cluster_id")
+            inclusion_reason = debug.get("inclusion_reason")
+            if inclusion_reason == "selected_primary_in_cluster":
+                cluster_primary_count[cluster_id] = cluster_primary_count.get(cluster_id, 0) + 1
+
+            nearest_id = debug.get("nearest_selected_region_id")
+            if nearest_id is not None and nearest_id not in final_ids:
+                raise ValueError(f"nearest_selected_region_id '{nearest_id}' is not in final selected set.")
+
+        bad_clusters = [cid for cid, count in cluster_primary_count.items() if count > 1]
+        if bad_clusters:
+            raise ValueError(f"Multiple selected_primary_in_cluster entries found for clusters: {bad_clusters}")
 
     def _make_overlay(self, pano_rgb: np.ndarray, heatmap_rgb: np.ndarray, proposals: List[RegionProposal]) -> np.ndarray:
         base = (np.clip(pano_rgb, 0, 1) * 255).astype(np.uint8)
@@ -469,7 +585,22 @@ class AmbiguityManager:
                     "debug": debug_payload,
                 }
             )
-        return {"queries": queries, "rejected_candidates": getattr(self, "_last_rejected_candidates", [])}
+        payload = {"queries": queries, "rejected_candidates": getattr(self, "_last_rejected_candidates", [])}
+        self._validate_export_payload(payload)
+        return payload
+
+    def _validate_export_payload(self, payload: Dict) -> None:
+        final_ids = [str(item.get("region_id")) for item in payload.get("queries", []) if item.get("region_id")]
+        rejected_ids = [
+            str(item.get("region_id")) for item in payload.get("rejected_candidates", []) if item.get("region_id")
+        ]
+        if len(final_ids) != len(set(final_ids)):
+            raise ValueError("Duplicate region ids detected in exported final queries.")
+        if len(rejected_ids) != len(set(rejected_ids)):
+            raise ValueError("Duplicate region ids detected in exported rejected candidates.")
+        overlap = set(final_ids).intersection(rejected_ids)
+        if overlap:
+            raise ValueError(f"Export payload has overlapping region ids in selected/rejected sets: {sorted(overlap)}")
 
 
 def dump_queries_json(path: str, queries: Dict) -> None:
