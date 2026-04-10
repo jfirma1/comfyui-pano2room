@@ -133,6 +133,17 @@ class Pano2RoomPipeline(torch.nn.Module):
             self.inpainter = PanoPersFusionInpainter(save_path=self.save_path)
         return self.inpainter
 
+    def _move_to_device(self, x):
+        if torch.is_tensor(x):
+            return x.to(self.device)
+        if isinstance(x, dict):
+            return {k: self._move_to_device(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [self._move_to_device(v) for v in x]
+        if isinstance(x, tuple):
+            return tuple(self._move_to_device(v) for v in x)
+        return x
+
     def project(self, world_to_cam):
         # project mesh into pose and render (rgb, depth, mask)
         rendered_image_tensor, self.rendered_depth, self.inpaint_mask, self.pix_to_face, self.z_buf, self.mesh = render_mesh(
@@ -667,9 +678,13 @@ class Pano2RoomPipeline(torch.nn.Module):
         }
 
     def _continue_from_initial_mesh(self, panorama_tensor, init_depth, depth_edge_inpaint_mask):
+        panorama_tensor = self._move_to_device(panorama_tensor)
+        init_depth = self._move_to_device(init_depth)
+        depth_edge_inpaint_mask = self._move_to_device(depth_edge_inpaint_mask).bool()
+
         self.sup_pool = SupInfoPool()
-        self.sup_pool.register_sup_info(pose=torch.eye(4).cuda(),
-                                        mask=torch.ones([self.pano_height, self.pano_width]),
+        self.sup_pool.register_sup_info(pose=torch.eye(4, device=self.device),
+                                        mask=torch.ones([self.pano_height, self.pano_width], device=self.device),
                                         rgb=panorama_tensor.permute(1,2,0),
                                         distance=init_depth.unsqueeze(-1))
         self.sup_pool.gen_occ_grid(256)
@@ -769,15 +784,16 @@ class Pano2RoomPipeline(torch.nn.Module):
     def resume_from_clarification(self, state_path, answer_json="", answer_json_path=""):
         stage_dir = os.path.dirname(state_path)
         state_payload = torch.load(state_path, map_location="cpu")
+        state_payload = self._move_to_device(state_payload)
         self._apply_runtime_settings(state_payload.get("runtime_settings", {}))
-        self.pano_pose = state_payload["pano_pose"].cpu().numpy()
-        self.poses = [p.cuda().float() for p in state_payload["poses"]]
+        self.pano_pose = state_payload["pano_pose"].detach().cpu().numpy()
+        self.poses = [p.float() for p in state_payload["poses"]]
         self.scene_depth_max = float(state_payload.get("scene_depth_max", 4.0228885328450446))
 
-        panorama_tensor = state_payload["pano_rgb"].cuda()
-        init_depth = state_payload["init_depth"].cuda()
-        depth_edges = state_payload["depth_edges"].cuda()
-        depth_edge_inpaint_mask = state_payload["depth_edge_inpaint_mask"].cuda().bool()
+        panorama_tensor = state_payload["pano_rgb"]
+        init_depth = state_payload["init_depth"]
+        depth_edges = state_payload["depth_edges"]
+        depth_edge_inpaint_mask = state_payload["depth_edge_inpaint_mask"].bool()
 
         queries_path = os.path.join(stage_dir, "queries.json")
         queries_payload = {"queries": []}
