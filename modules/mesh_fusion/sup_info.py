@@ -290,12 +290,14 @@ class SupInfoPool:
         rays_o, rays_d = self.all_sup_rays.collapse()
         dis = self.all_sup_distances
         pts = rays_o + rays_d * dis.squeeze()[..., None]
-        occ_grid = torch.zeros([res * res * res], dtype=torch.uint8)
+        device = pts.device
+        occ_grid = torch.zeros([res * res * res], dtype=torch.uint8, device=device)
         shift = 1. / res
         xx, yy, zz = torch.meshgrid(
-            torch.linspace(-shift, shift, 3),
-            torch.linspace(-shift, shift, 3),
-            torch.linspace(-shift, shift, 3)
+            torch.linspace(-shift, shift, 3, device=device),
+            torch.linspace(-shift, shift, 3, device=device),
+            torch.linspace(-shift, shift, 3, device=device),
+            indexing='ij'
         )
         shift_xyzs = torch.stack([xx, yy, zz], -1).reshape(-1, 3)
         for shift_xyz in shift_xyzs:
