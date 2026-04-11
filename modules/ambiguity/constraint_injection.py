@@ -32,8 +32,32 @@ def apply_constraints(
     for item in constraints:
         x1, y1, x2, y2 = _clamp_bbox(item.bbox, h, w)
         roi = depth[y1:y2, x1:x2]
+        phenomenon = item.phenomenon_class
 
-        if item.answer == "flat_wall":
+        if phenomenon in ("reflection_or_highlight", "mirror_surface"):
+            depth[y1:y2, x1:x2] = cv2.GaussianBlur(roi, (0, 0), sigmaX=2.0)
+            edges[y1:y2, x1:x2] = cv2.erode(edges[y1:y2, x1:x2], np.ones((3, 3), np.uint8), iterations=1)
+            debug[y1:y2, x1:x2, :] = np.array([255, 180, 0], dtype=np.uint8)
+        elif phenomenon == "glass_or_window":
+            depth[y1:y2, x1:x2] = 0.8 * roi + 0.2 * cv2.GaussianBlur(roi, (0, 0), sigmaX=1.5)
+            edges[y1:y2, x1:x2] = cv2.erode(edges[y1:y2, x1:x2], np.ones((3, 3), np.uint8), iterations=1)
+            inpaint_mask[y1:y2, x1:x2] = np.minimum(inpaint_mask[y1:y2, x1:x2], 1)
+            debug[y1:y2, x1:x2, :] = np.array([180, 255, 180], dtype=np.uint8)
+        elif phenomenon == "object_edge_not_layout":
+            cv2.rectangle(edges, (x1, y1), (x2 - 1, y2 - 1), 255, 1)
+            inpaint_mask[y1:y2, x1:x2] = np.minimum(inpaint_mask[y1:y2, x1:x2], 1)
+            debug[y1:y2, x1:x2, :] = np.array([255, 0, 255], dtype=np.uint8)
+        elif phenomenon in ("real_room_boundary", "opening_or_passage"):
+            inpaint_mask[y1:y2, x1:x2] = 0
+            edges[y1:y2, x1:x2] = cv2.dilate(edges[y1:y2, x1:x2], np.ones((3, 3), np.uint8), iterations=1)
+            debug[y1:y2, x1:x2, :] = np.array([0, 80, 255], dtype=np.uint8)
+        elif phenomenon == "continuous_surface":
+            local = depth[y1:y2, x1:x2]
+            blur = cv2.GaussianBlur(local, (0, 0), sigmaX=3.0)
+            depth[y1:y2, x1:x2] = 0.5 * local + 0.5 * blur
+            edges[y1:y2, x1:x2] = cv2.erode(edges[y1:y2, x1:x2], np.ones((3, 3), np.uint8), iterations=1)
+            debug[y1:y2, x1:x2, :] = np.array([80, 220, 120], dtype=np.uint8)
+        elif item.answer == "flat_wall":
             plane_value = float(np.median(roi))
             smoothed = cv2.GaussianBlur(roi, (0, 0), sigmaX=2.0)
             depth[y1:y2, x1:x2] = 0.65 * smoothed + 0.35 * plane_value
@@ -62,6 +86,18 @@ def apply_constraints(
             debug[y1:y2, x1:x2, :] = np.array([80, 80, 80], dtype=np.uint8)
 
         cv2.rectangle(debug, (x1, y1), (x2 - 1, y2 - 1), (255, 255, 255), 1)
+        print(
+            "[Ambiguity] region=%s parse=%s raw='%s' phenomenon=%s geometry=%s policy=%s fallback=%s"
+            % (
+                item.region_id,
+                item.parse_method,
+                item.raw_text,
+                item.phenomenon_class,
+                item.geometry_class,
+                item.structural_policy,
+                item.fallback_reason,
+            )
+        )
 
     new_depth = torch.from_numpy(depth).to(init_depth.device, dtype=init_depth.dtype)
     new_edges = torch.from_numpy(edges).to(depth_edges.device, dtype=depth_edges.dtype)

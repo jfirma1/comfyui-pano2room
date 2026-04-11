@@ -37,6 +37,21 @@ import numpy as np
 import torch
 from PIL import Image
 
+DEFAULT_AMBIGUITY_CHOICES = [
+    "flat_wall",
+    "sharp_corner",
+    "same_surface",
+    "opening",
+    "unknown",
+    "reflection_or_highlight",
+    "mirror_surface",
+    "glass_or_window",
+    "object_edge_not_layout",
+    "real_room_boundary",
+    "continuous_surface",
+    "opening_or_passage",
+]
+
 # Resolve paths relative to THIS file
 NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 PANO2ROOM_DIR = NODE_DIR  # This file lives inside the Pano2Room repo clone
@@ -382,7 +397,7 @@ def _format_query_questions(query_payload):
         question = str(q.get("question", "How should this ambiguous region be interpreted?"))
         allowed = q.get("allowed_choices", [])
         if not isinstance(allowed, list) or not allowed:
-            allowed = ["flat_wall", "sharp_corner", "same_surface", "opening", "unknown"]
+            allowed = list(DEFAULT_AMBIGUITY_CHOICES)
         choices = ", ".join([str(c) for c in allowed])
         bbox_text = _format_bbox(q.get("bbox"))
         blocks.append(
@@ -395,7 +410,7 @@ def _format_query_questions(query_payload):
 
 def _allowed_choice_map(query_payload):
     choices_by_region = {}
-    default_choices = set(["flat_wall", "sharp_corner", "same_surface", "opening", "unknown"])
+    default_choices = set(DEFAULT_AMBIGUITY_CHOICES)
     for q in query_payload.get("queries", []):
         region_id = str(q.get("region_id", "")).strip()
         if not region_id:
