@@ -624,7 +624,7 @@ class Pano2RoomPipeline(torch.nn.Module):
         depth_edge = self.find_depth_edge(init_depth.cpu().detach().numpy(), dilate_iter=1)
         depth_edge_inpaint_mask = ~(torch.from_numpy(depth_edge).cuda().bool())
 
-        stage_dir = state_dir or self._session_output_dir("probe")
+        stage_dir = os.path.abspath(state_dir or self._session_output_dir("probe"))
         ambiguity_manager = AmbiguityManager(top_k=3)
         ambiguity_info = ambiguity_manager.compute(
             pano_rgb=panorama_tensor.permute(1, 2, 0).detach().cpu().numpy(),
@@ -632,9 +632,11 @@ class Pano2RoomPipeline(torch.nn.Module):
             depth_edges=depth_edge.astype(np.uint8),
         )
 
-        Image.fromarray(ambiguity_info["heatmap"]).save(os.path.join(stage_dir, "ambiguity_heatmap.png"))
-        Image.fromarray(ambiguity_info["overlay"]).save(os.path.join(stage_dir, "ambiguity_overlay.png"))
-        queries_path = os.path.join(stage_dir, "queries.json")
+        heatmap_path = os.path.abspath(os.path.join(stage_dir, "ambiguity_heatmap.png"))
+        overlay_path = os.path.abspath(os.path.join(stage_dir, "ambiguity_overlay.png"))
+        Image.fromarray(ambiguity_info["heatmap"]).save(heatmap_path)
+        Image.fromarray(ambiguity_info["overlay"]).save(overlay_path)
+        queries_path = os.path.abspath(os.path.join(stage_dir, "queries.json"))
         dump_queries_json(queries_path, ambiguity_info["queries"])
 
         depth_edge_pil = Image.fromarray(depth_edge)
@@ -651,7 +653,7 @@ class Pano2RoomPipeline(torch.nn.Module):
             "runtime_settings": self._runtime_settings(),
             "scene_depth_max": float(self.scene_depth_max),
         }
-        state_path = os.path.join(stage_dir, "intermediate_state.pt")
+        state_path = os.path.abspath(os.path.join(stage_dir, "intermediate_state.pt"))
         torch.save(state_payload, state_path)
         metadata = {
             "state_path": state_path,
@@ -673,8 +675,8 @@ class Pano2RoomPipeline(torch.nn.Module):
             "state_dir": stage_dir,
             "queries": ambiguity_info["queries"],
             "queries_path": queries_path,
-            "ambiguity_heatmap_path": os.path.join(stage_dir, "ambiguity_heatmap.png"),
-            "ambiguity_overlay_path": os.path.join(stage_dir, "ambiguity_overlay.png"),
+            "ambiguity_heatmap_path": heatmap_path,
+            "ambiguity_overlay_path": overlay_path,
         }
 
     def _continue_from_initial_mesh(self, panorama_tensor, init_depth, depth_edge_inpaint_mask):

@@ -293,6 +293,15 @@ def _parse_last_json_line(stdout_text):
     return {}
 
 
+def _resolve_probe_artifact_path(path):
+    if not path:
+        return ""
+    if os.path.isabs(path):
+        return os.path.abspath(path)
+    # Relative paths are anchored to this repo, not ComfyUI process cwd.
+    return os.path.abspath(os.path.join(PANO2ROOM_DIR, path))
+
+
 def _load_optional_image(path):
     if path and os.path.exists(path):
         return pil_to_tensor(Image.open(path).convert("RGB"))
@@ -308,15 +317,20 @@ def _image_path_to_comfy_tensor(path, label="image", required=False, debug=True)
         print(msg)
         return _load_optional_image("")
 
-    if not os.path.exists(path):
-        msg = f"[Pano2Room] {label} file does not exist: {path}"
+    resolved_path = _resolve_probe_artifact_path(path)
+
+    if not os.path.exists(resolved_path):
+        msg = (
+            f"[Pano2Room] {label} file does not exist. "
+            f"raw_path={path!r}, resolved_path={resolved_path!r}, cwd={os.getcwd()!r}"
+        )
         if required:
             raise FileNotFoundError(msg)
         print(msg)
         return _load_optional_image("")
 
     try:
-        pil_img = Image.open(path).convert("RGB")
+        pil_img = Image.open(resolved_path).convert("RGB")
     except Exception as e:
         msg = f"[Pano2Room] Failed to open {label} image '{path}': {e}"
         if required:
@@ -330,7 +344,7 @@ def _image_path_to_comfy_tensor(path, label="image", required=False, debug=True)
         t_min = float(tensor.min().item()) if tensor.numel() else 0.0
         t_max = float(tensor.max().item()) if tensor.numel() else 0.0
         print(
-            f"[Pano2Room] Loaded {label}: path={path}, arr_shape={arr.shape}, "
+            f"[Pano2Room] Loaded {label}: raw_path={path}, resolved_path={resolved_path}, arr_shape={arr.shape}, "
             f"tensor_shape={tuple(tensor.shape)}, dtype={tensor.dtype}, min={t_min:.6f}, max={t_max:.6f}"
         )
     return tensor
