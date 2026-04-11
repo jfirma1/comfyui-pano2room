@@ -810,6 +810,23 @@ class Pano2RoomPipeline(torch.nn.Module):
         if answers:
             with open(os.path.join(stage_dir, "clarification_answers.json"), "w", encoding="utf-8") as f:
                 json.dump(answers_payload, f, indent=2)
+            interpretation_log = []
+            for answer in answers:
+                interpretation_log.append(
+                    {
+                        "region_id": answer.region_id,
+                        "raw_text": answer.raw_text,
+                        "answer": answer.answer,
+                        "phenomenon_class": answer.phenomenon_class,
+                        "geometry_class": answer.geometry_class,
+                        "structural_policy": answer.structural_policy,
+                        "confidence": answer.confidence,
+                        "parse_method": answer.parse_method,
+                        "fallback_reason": answer.fallback_reason,
+                    }
+                )
+            with open(os.path.join(stage_dir, "clarification_interpretation_log.json"), "w", encoding="utf-8") as f:
+                json.dump({"answers": interpretation_log}, f, indent=2)
 
         if constraints:
             init_depth, depth_edges, depth_edge_inpaint_mask, debug_img = apply_constraints(
